@@ -1,0 +1,56 @@
+name: Track upstream release
+
+on:
+  schedule:
+    - cron: '41 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Read the latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release="$(gh api repos/bggRGjQaUbCoE/PiliPlus/releases/latest)"
+          version="$(jq -r .tag_name <<<"$release")"
+          current="$(jq -r .version nix/release.json)"
+          # A re-run upstream can move "latest" back to an older tag; never follow it down.
+          if [ "$(printf '%s\n' "$current" "$version" | sort -V | tail -n1)" != "$version" ]; then
+            echo "Keeping ${current}: upstream latest is ${version}."
+            exit 0
+          fi
+          # The asset name carries the build number (PiliPlus_linux_2.2.0+5598_amd64.tar.gz), not the tag.
+          asset="$(jq -c '[.assets[] | select(.name | test("^PiliPlus_linux_.*_amd64\\.tar\\.gz$"))]' <<<"$release")"
+          [ "$(jq length <<<"$asset")" = 1 ] || { echo "Expected one Linux tarball in ${version}." >&2; exit 1; }
+          name="$(jq -r '.[0].name' <<<"$asset")"
+          digest="$(jq -r '.[0].digest' <<<"$asset")"
+          hash="$(nix hash convert --hash-algo sha256 --to sri "${digest#sha256:}")"
+          jq -n --arg version "$version" --arg asset "$name" --arg hash "$hash" '{$version, $asset, $hash}' > nix/release.json
+
+      # A wrong hash or a library the package does not provide stops here, before the commit.
+      - name: Build
+        run: nix build .#piliplus --no-link
+
+      - name: Commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet nix/release.json; then
+            echo "Already at the latest release."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898583+github-actions[bot]@users.noreply.github.com'
+          git commit -m "chore(nix): update to $(jq -r .version nix/release.json)" nix/release.json
+          git push origin HEAD:nix
